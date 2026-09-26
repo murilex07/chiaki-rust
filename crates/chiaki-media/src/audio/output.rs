@@ -3,28 +3,40 @@
 //! (`InitAudio`, `PushAudioFrame`, `QueueAudioOutData`,
 //! `DrainAudioOutRingBuffer`, `AudioOutDrainThreadMain`) auf cpal/WASAPI.
 //!
-//! Architektur-Unterschied zum C++: SDL2 hatte zwei Stufen (Session-Thread
-//! füllt einen Ring, ein Drain-Thread kopiert in die SDL-Queue und wartet bei
-//! Rückstand 1 ms statt 4 ms — REWORK.md Abschnitt 2.2, "Backpressure"), und
-//! SDLs interner Callback verbrauchte die Queue. cpal liefert uns den
-//! Echtzeit-Callback selbst: die Session pusht dekodierte Frames in einen
-//! festen Ring ([`SampleRing`]), der Audio-Thread zieht sie direkt heraus.
-//! Der Drain-Thread samt Warteschleife entfällt damit; die wirksame
-//! Backpressure-Wartezeit ist 0 ms (jede Probe ist spätestens nach einer
-//! Callback-Periode verbraucht), das Überlaufverhalten bleibt identisch:
-//! älteste Samples werden gedroppt (`QueueAudioOutData`), bei leerem Ring
-//! spielt der Callback Stille (SDL-Unterrun-Verhalten).
+//! Architektur (seit 12.09. zweistufig, wieder wie im C++): Der C++-Client
+//! hatte zwei Pufferstufen — der Decoder füllt einen Ring
+//! (`QueueAudioOutData`), ein Drain-Thread (`DrainAudioOutRingBuffer`/
+//! `AudioOutDrainThreadMain`) kopiert daraus in die SDL-Geräte-Queue, und
+//! SDLs eigener Thread verbraucht sie. Der erste Port hatte das auf EINE
+//! Stufe reduziert (cpal-Callback zog direkt aus dem Decode-Ring) — das
+//! reichte nicht: Unter Gameplay-Last kommen Audiopakete in Schüben, der
+//! dünne Ring pendelte zwischen Fast-Leer (Crackle) und Überlauf
+//! (Latenz-Guard-Schnitte; Messung 12.09.: 396 Schnitte/32 min ohne
+//! Kamera). Deshalb wieder zwei Stufen:
+//!
+//! 1. **Decode-Ring** — der Audio-Thread pusht sofort bei Ankunft; kein
+//!    Guard, nur Drop-Oldest bei Überlauf (C++ `QueueAudioOutData`).
+//! 2. **Drain-Thread** — wacht bei Nachschub auf und hält den
+//!    **Device-Ring** auf dem C++-Drain-Target (2×buffer); überschreitet
+//!    er die Latenzgrenze (3×buffer), wirft er den kompletten Rückstand
+//!    weg (C++-Guard, "Audio queue exceeded latency threshold").
+//! 3. **cpal-Callback** — zieht aus dem Device-Ring; leer → Stille
+//!    (Unterlauf-Zähler, Prime-Phase wie gehabt).
+//!
+//! Ankunftsbursts landen damit im Decode-Ring (Kapazität 8×buffer) und
+//! treffen den Device-Ring nur über den glatten Drain — beides Crackling-
+//! Quellen der Ein-Stufen-Version sind damit entschärft.
 //!
 //! Alle von `settings` kommenden Größen sind wie im C++ **Bytes** von
 //! S16-PCM: Ring = `8 * audio_buffer_size`, Latenzgrenze = `3 *
 //! audio_buffer_size` ("Audio queue exceeded latency threshold"), Default
 //! 9600 = 50 ms @ 48 kHz stereo. Der Callback beginnt erst zu spielen,
-//! wenn `2 * audio_buffer_size` im Ring stehen (C++: Drain-Target der
-//! Device-Queue) und geht nach jedem Unterlauf wieder in die Prime-Phase —
-//! ohne das lief der Ring dauerhaft mit 10–30 ms Füllstand am
-//! Unterlauf-Anschlag (Messung 06.09.).
+//! wenn `2 * audio_buffer_size` im Device-Ring stehen (C++: Drain-Target
+//! der Device-Queue) und geht nach jedem Unterlauf wieder in die
+//! Prime-Phase — ohne das lief der Ring dauerhaft mit 10–30 ms Füllstand
+//! am Unterlauf-Anschlag (Messung 06.09.).
 
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chiaki_core::{ChiakiError, ChiakiResult};
@@ -236,6 +248,45 @@ impl SampleRing {
         done
     }
 
+    /// Drain-seitige Entnahme (Decode-Ring → Device-Ring): kopiert bis zu
+    /// `max` Samples nach `out` (Wrap-arounds wie `pull`) — OHNE Prime-/
+    /// Underflow-Logik (die gehört zum Device-Ring und dessen Callback).
+    fn pop(&self, max: usize, out: &mut Vec<i16>) -> usize {
+        out.clear();
+        if let Ok(mut state) = self.state.lock() {
+            let capacity = state.buf.len();
+            let want = max.min(state.fill);
+            if want > 0 {
+                let first = want.min(capacity - state.read);
+                out.extend_from_slice(&state.buf[state.read..state.read + first]);
+                if want > first {
+                    out.extend_from_slice(&state.buf[..want - first]);
+                }
+                state.read = (state.read + want) % capacity;
+                state.fill -= want;
+                state.overflow_warned = false;
+            }
+            return want;
+        }
+        0
+    }
+
+    /// C++-Queue-Clear im Drain (`SDL_GetQueuedAudioSize > 3×buffer`): den
+    /// kompletten Rückstand verwerfen, Zähler/Prime zurücksetzen.
+    fn clear_backlog(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            self.dropped
+                .fetch_add(state.fill as u64, Ordering::Relaxed);
+            state.read = 0;
+            state.write = 0;
+            state.fill = 0;
+            state.overflow_warned = false;
+            state.primed = false;
+            self.clears.fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::warn!("Audio queue exceeded latency threshold, clearing queued audio");
+    }
+
     /// Warn-Flagge (Testbeobachtung von audio_out_overflow_logged).
     #[cfg(test)]
     fn overflow_warned(&self) -> bool {
@@ -264,16 +315,25 @@ fn apply_volume(samples: &mut [i16], volume128: i32) {
 // AudioOutput
 // ---------------------------------------------------------------------------
 
-/// Shared State zwischen Session-Thread (push/volume) und cpal-Callback.
+/// Shared State zwischen Audio-Thread (push), Drain-Thread (Stufe 1 → 2)
+/// und cpal-Callback.
 struct OutShared {
-    ring: SampleRing,
+    /// Stufe 1: Decode-Seite — der Audio-Thread pusht sofort bei Ankunft;
+    /// Überlauf → Drop-Oldest. Kein Guard (C++ `QueueAudioOutData`).
+    decode_ring: SampleRing,
+    /// Stufe 2: Device-Seite — der Drain-Thread hält sie auf dem C++-
+    /// Drain-Target (2×buffer), der cpal-Callback zieht daraus. Der
+    /// 3×-Guard lebt im Drain (C++: SDL_GetQueuedAudioSize > 3×buffer).
+    device_ring: SampleRing,
     /// `settings/audio_volume` 0..=128 (SDL_MIX_MAXVOLUME-Skala).
     volume128: AtomicU32,
-    /// Latenzgrenze in Samples: `3 * audio_buffer_size` Bytes.
-    clear_threshold: u64,
     /// Session-Format (das Format, das `push` liefert) — für fill_ms.
     sample_rate: u32,
     channels: u16,
+    /// Drain-Thread-Steuerung (Drop des AudioOutput setzt Stop + Weckruf).
+    stop: AtomicBool,
+    drain_mx: Mutex<()>,
+    drain_cv: std::sync::Condvar,
 }
 
 /// Audio-Ausgabe (Lautsprecher). Port von `InitAudio`/`PushAudioFrame`.
@@ -336,14 +396,18 @@ impl AudioOutput {
         let shared = Arc::new(OutShared {
             // C++: ring_buf.resize(audio_buffer_size * 8) ist in BYTES — bei
             // S16 also 38400 Samples (nicht buffer_samples × 4: das wäre nur
-            // die halbe C++-Kapazität). Vorfüllung = C++-Drain-Target
-            // (2×audio_buffer_size Bytes = 2×buffer_samples Samples), damit
-            // der Ring nicht dauerhaft am Leerlauf-Anschlag läuft.
-            ring: SampleRing::new(buffer_samples * 8, buffer_samples * 2),
+            // die halbe C++-Kapazität).
+            decode_ring: SampleRing::new(buffer_samples * 8, 0),
+            // Device-Ring: Prefill = C++-Drain-Target (2×audio_buffer_size
+            // Bytes = 2×buffer_samples Samples), damit der Callback nicht
+            // dauerhaft am Leerlauf-Anschlag spielt.
+            device_ring: SampleRing::new(buffer_samples * 8, buffer_samples * 2),
             volume128: AtomicU32::new(SDL_MIX_MAXVOLUME),
-            clear_threshold: (buffer_samples * 3) as u64, // C++: SDL_GetQueuedAudioSize > 3 * audio_buffer_size
             sample_rate,
             channels,
+            stop: std::sync::atomic::AtomicBool::new(false),
+            drain_mx: Mutex::new(()),
+            drain_cv: std::sync::Condvar::new(),
         });
 
         // C++ InitAudio-Logzeile, falls SDL konvertieren musste.
@@ -382,6 +446,53 @@ impl AudioOutput {
         // C++: SDL_PauseAudioDevice(audio_out, 0) — der Stream spielt sofort.
         stream.play().map_err(|_| ChiakiError::Unknown)?;
 
+        // Drain-Thread (Stufe 1 → 2), C++ `AudioOutDrainThreadMain`: hält
+        // den Device-Ring auf 2×buffer und wirft bei 3× den Rückstand weg.
+        {
+            let shared = Arc::clone(&shared);
+            let chunk_cap = buffer_samples * 2; // größer als ein Drain-Nachschuss je Fall
+            std::thread::Builder::new()
+                .name("chiaki-media-audio-drain".into())
+                .spawn(move || {
+                    let mut scratch: Vec<i16> = Vec::with_capacity(chunk_cap);
+                    let mx = shared.drain_mx.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut mx_guard = mx;
+                    loop {
+                        if shared.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        drop(mx_guard);
+                        // Nachschub: Device-Ring auf das Drain-Target füllen.
+                        loop {
+                            let fill = shared.device_ring.fill() as usize;
+                            if fill >= buffer_samples * 2 {
+                                break;
+                            }
+                            let want = (buffer_samples * 2 - fill).min(chunk_cap);
+                            let got = shared.decode_ring.pop(want, &mut scratch);
+                            if got == 0 {
+                                break;
+                            }
+                            // Push mit dem 3×-Guard als Sicherheitsnetz —
+                            // regulär hält der Drain das Ziel ein.
+                            shared.device_ring.push(&scratch[..got], u64::MAX);
+                        }
+                        let mx2 = shared.drain_mx.lock().unwrap_or_else(|e| e.into_inner());
+                        mx_guard = mx2;
+                        // Auf Nachschub warten (Push weckt; 20 ms Tick als
+                        // Netz gegen verlorene Wakeups).
+                        if shared.decode_ring.fill() == 0 {
+                            let (g, _timeout) = shared
+                                .drain_cv
+                                .wait_timeout(mx_guard, std::time::Duration::from_millis(20))
+                                .unwrap_or_else(|e| e.into_inner());
+                            mx_guard = g;
+                        }
+                    }
+                })
+                .expect("Audio-Drain-Thread starten");
+        }
+
         tracing::info!(
             "Audio Device '{}' opened with {} channels @ {} Hz, buffer size {}",
             device_name,
@@ -416,7 +527,11 @@ impl AudioOutput {
         if self.shared.volume128.load(Ordering::Relaxed) == 0 {
             return;
         }
-        self.shared.ring.push(samples, self.shared.clear_threshold);
+        // Stufe 1: ohne Guard — Ankunftsbursts werden vom Decode-Ring
+        // geschluckt (Drop-Oldest jenseits der Kapazität). Der 3×-Guard
+        // liegt auf der Device-Seite (Drain-Thread).
+        self.shared.decode_ring.push(samples, u64::MAX);
+        self.shared.drain_cv.notify_all();
     }
 
     /// Lautstärke 0.0..=1.0 (Einstellung `settings/audio_volume` 0..=128 →
@@ -439,7 +554,8 @@ impl AudioOutput {
     /// Ring-Füllstand in Millisekunden Session-Audio — für das Stats-HUD
     /// (C++ hatte dafür nur ein auskommentiertes qDebug über die SDL-Queue).
     pub fn current_buffer_fill_ms(&self) -> f32 {
-        let fill = self.shared.ring.fill() as f32;
+        // Device-Seite: das ist die echte Ausgabelatenz (C++: SDL-Queue).
+        let fill = self.shared.device_ring.fill() as f32;
         let samples_per_ms = f32::from(self.shared.channels) * self.shared.sample_rate as f32
             / 1000.0;
         if samples_per_ms <= 0.0 {
@@ -451,28 +567,29 @@ impl AudioOutput {
 
     /// Durch Überlauf verworfene Samples (kumulativ).
     pub fn dropped_samples(&self) -> u64 {
-        self.shared.ring.dropped.load(Ordering::Relaxed)
+        self.shared.decode_ring.dropped.load(Ordering::Relaxed)
+            + self.shared.device_ring.dropped.load(Ordering::Relaxed)
     }
 
     /// In den Ring geschobene Samples (kumulativ) — Messung Producer-/Konsum-
     /// Bilanz (HANDOFF P1 "Audio queue exceeded").
     pub fn pushed_samples(&self) -> u64 {
-        self.shared.ring.pushed.load(Ordering::Relaxed)
+        self.shared.decode_ring.pushed.load(Ordering::Relaxed)
     }
 
     /// Vom Gerät-Callback entnommene Samples (kumulativ).
     pub fn pulled_samples(&self) -> u64 {
-        self.shared.ring.pulled.load(Ordering::Relaxed)
+        self.shared.device_ring.pulled.load(Ordering::Relaxed)
     }
 
     /// Ausgelöste 3×-Latenz-Clears (kumulativ).
     pub fn clears(&self) -> u64 {
-        self.shared.ring.clears.load(Ordering::Relaxed)
+        self.shared.device_ring.clears.load(Ordering::Relaxed)
     }
 
     /// Callbacks, in denen Stille wegen leerem Ring nachgespielt wurde.
     pub fn underflows(&self) -> u64 {
-        self.shared.ring.underflows.load(Ordering::Relaxed)
+        self.shared.device_ring.underflows.load(Ordering::Relaxed)
     }
 
     /// Aufgelöster Gerätename (nach Fallback auf den Default).
@@ -509,6 +626,15 @@ impl std::fmt::Debug for AudioOutput {
             .field("channels", &self.obtained_channels)
             .field("sample_format", &self.obtained_sample_format)
             .finish()
+    }
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        // Drain-Thread stoppen (Stream Drop danach im Feld-Teardown —
+        // der cpal-Callback endet mit dem Stream).
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.drain_cv.notify_all();
     }
 }
 
@@ -560,7 +686,7 @@ fn build_stream(
                         {
                             let pcm = &mut scratch[..frames * sess_ch];
                             pcm.fill(0); // Underflow → Stille (SDL-Unterrun-Verhalten)
-                            shared.ring.pull(pcm);
+                            shared.device_ring.pull(pcm);
                             apply_volume(pcm, shared.volume128.load(Ordering::Relaxed) as i32);
                         }
                         map_channels(
@@ -797,10 +923,11 @@ mod tests {
         // 100 ms @ 48 kHz stereo = 4800 Frames = 9600 Samples (Stille).
         let silence = vec![0i16; 9600];
         out.push(&silence);
-        assert!(out.current_buffer_fill_ms() > 90.0, "Ring sollte ~100 ms enthalten");
+        // Zweistufig: push landet im Decode-Ring, der Drain-Thread überführt
+        // in den Device-Ring — nach 300 ms hat der Callback beides verbraucht
+        // (Underflow zählt ggf. die Restperiode — Hauptsache, nichts ist mehr
+        // angestaut).
         std::thread::sleep(std::time::Duration::from_millis(300));
-        // Der Echtzeit-Callback hat den Ring leer gezogen (Underflow zählt
-        // ggf. die Restperiode — Hauptsache, nichts ist mehr angestaut).
         assert!(out.current_buffer_fill_ms() < 1.0);
         println!(
             "underflows: {}, dropped: {}",
@@ -808,6 +935,37 @@ mod tests {
             out.dropped_samples()
         );
         drop(out); // sauberer Stop (C++: SDL_CloseAudioDevice)
+    }
+
+    /// Zwei-Stufen-Durchlauf (Kern des Drain-Threads): Decode-Ring → pop →
+    /// Device-Ring → pull liefert die Daten in Original-Reihenfolge; Bursts
+    /// im Decode-Ring ändern das Ergebnis nicht.
+    #[test]
+    fn two_stage_drain_preserves_order() {
+        let decode = ring(64);
+        let device = SampleRing::new(64, 0);
+        let mut scratch: Vec<i16> = Vec::new();
+
+        // Ankunftsburst: alles auf einmal in Stufe 1.
+        decode.push(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], u64::MAX);
+
+        // Drain-Schritt wie im Drain-Thread (pop → push, ohne Guard).
+        let got = decode.pop(4, &mut scratch);
+        assert_eq!(got, 4);
+        device.push(&scratch, u64::MAX);
+
+        let mut out = [0i16; 4];
+        assert_eq!(device.pull(&mut out), 4);
+        assert_eq!(out, [1, 2, 3, 4]);
+
+        // Rest rüberdrainen, inklusive Wrap-around-Kanten.
+        let got = decode.pop(8, &mut scratch);
+        assert_eq!(got, 6);
+        device.push(&scratch, u64::MAX);
+        let mut out = [0i16; 8];
+        assert_eq!(device.pull(&mut out), 6);
+        assert_eq!(&out[..6], &[5, 6, 7, 8, 9, 10]);
+        assert_eq!(decode.fill(), 0);
     }
 
     /// Geräte-Enumeration gegen den WASAPI-Host.
